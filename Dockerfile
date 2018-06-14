@@ -1,7 +1,8 @@
 FROM golang:1.10
 
-VOLUME /code
-
 COPY . /code
 WORKDIR /code
 
+RUN go get -u github.com/gorilla/mux
+
+RUN go build src/client.go

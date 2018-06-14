@@ -1,81 +1,64 @@
 package main
 
-import "flag"
-import "fmt"
-import "strings"
 import (
 	"encoding/json"
+	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
-	// "net/url"
+	"strings"
+    "strconv"
     "github.com/gorilla/mux"
 )
 
-var connectedClients []int
-var stringSet map[string]struct{}
-var name string
-var port int
-var delimitedNodeString string
-var delimitedNodes []string
-var connectedHostsMap map[string]string
-var sourceUrl string
+
+var ClientName string
+var ClientUrl string
+var ConnectedHostsMap map[string]string
+var Port int
 
 
-// func ConstructUrl(location string) (url string){
-// 	return 
-// }
-
-func WhisperMessage(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
+func WhisperMessageHandler(w http.ResponseWriter, r *http.Request) {
 	message := r.URL.Query().Get("message")
-	targetUrl := fmt.Sprintf("http://%s/recieve", sourceUrl)
+	targetName := string(r.URL.Query().Get("name"))
 
-	fmt.Printf("[%s] Message sent to %s at %s :: %s\n", name, name, targetUrl, message)
-
-	whisperRequest := BuildWhisperRequest(targetUrl, sourceUrl, message)
-	SendMessage(whisperRequest)
+	if targetLocation, ok := ConnectedHostsMap[targetName]; ok {
+		fmt.Printf("[%s] Message sent to %s at %s :: %s\n", ClientName, targetName, targetLocation, message)
+	
+		whisperRequest := BuildHttpWhisperRequest(targetLocation, ClientName, message)
+		SendMessage(whisperRequest)
+	} else {
+		panicMessage := fmt.Sprintf("Did not find target %s in connected hosts", targetName)
+		http.Error(w, panicMessage, http.StatusBadRequest)
+	}
 }
 
-func RecieveMessage(w http.ResponseWriter, r *http.Request) {
+func RecieveMessageHandler(w http.ResponseWriter, r *http.Request) {
 	message := r.URL.Query().Get("message")
 	senderName := r.URL.Query().Get("name")
-
-	fmt.Printf("[%s] Message received from %s at %s :: %s\n", name, senderName, sourceUrl, message)
-}
-
-func RequestInfo(nodeUrl string) {
-	requestUrl := fmt.Sprintf("http://%s/info", nodeUrl)
-	req, createReqErr := http.NewRequest(
-		"GET",
-		requestUrl,
-		nil,
-	)
-	if createReqErr != nil {
-		panic(createReqErr) // NewRequest only errors on bad methods or un-parsable urls
+	if senderUrl, ok := ConnectedHostsMap[senderName]; ok {
+		fmt.Printf("[%s] Message received from %s at %s :: %s\n", ClientName, senderName, senderUrl, message)
+	} else {
+		panicMessage := fmt.Sprintf("Did not find source host %s in connected hosts", senderName)
+		http.Error(w, panicMessage, http.StatusBadRequest)
 	}
-	fmt.Println("Sending Request Info", req)
-	response := SendMessage(req)
-
-	defer response.Body.Close()
-
-	responseData, err := ioutil.ReadAll(response.Body)
-    if err != nil {
-        log.Fatal(err)
-    }
- 
-    responseString := string(responseData)
-
-	connectedHostsMap[nodeUrl] = responseString
-	fmt.Printf("[%s] Connected to %s at %s\n", name, responseString, nodeUrl)
-
-	// fmt.Println("Got Response", responseString)
 }
 
-func ReturnInfo(w http.ResponseWriter, r *http.Request) {
-	nameJson, err := json.Marshal(name)
+func ConnectNodeHandler(w http.ResponseWriter, r *http.Request) {
+	requestNodeName := r.URL.Query().Get("name")
+	requestNodeUrl := r.URL.Query().Get("url")
+	
+	if ConnectedHostsMap != nil {
+		ConnectedHostsMap[requestNodeName] = requestNodeUrl
+		fmt.Printf("[%s] Connected to %s at %s\n", ClientName, requestNodeName, requestNodeUrl)
+	} else {
+		http.Error(w, "Host Map Not Initialized", http.StatusBadRequest)
+	}
+
+	nameJson, err := json.Marshal(ClientName)
 	if err != nil {
-		panic(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -83,60 +66,98 @@ func ReturnInfo(w http.ResponseWriter, r *http.Request) {
 	w.Write(nameJson)
 }
 
-func BuildWhisperRequest(targetUrl string, requestSender string, requestMessage string) (req *http.Request){
+func RequestConnectNode(nodeUrl string) {
+	req := BuildHttpConnectNodeRequest(nodeUrl)
+	response := SendMessage(req)
+
+	if response.StatusCode == http.StatusOK {
+		defer response.Body.Close()
+
+		responseData, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			panic(err) // panic vs exception?
+		}
+	 
+		responseString, _ := strconv.Unquote(string(responseData))
+		ConnectedHostsMap[responseString] = nodeUrl
+		fmt.Printf("[%s] Connected to %s at %s\n", ClientName, responseString, nodeUrl)
+	} else {
+		panicMessage := fmt.Sprintf("Recieved RequestConnectNode response with status code %d", response.StatusCode)
+		panic(panicMessage)
+	}
+}
+
+func SendMessage(req *http.Request) (res *http.Response) {
+	res, sendReqErr := http.DefaultClient.Do(req)
+	if sendReqErr != nil {
+		panic(sendReqErr)
+	}
+	return res
+}
+
+func BuildHttpConnectNodeRequest(targetUrl string) (req *http.Request) {
+	requestUrl := fmt.Sprintf("http://%s/connect", targetUrl)
 	req, createReqErr := http.NewRequest(
 		"GET",
-		targetUrl,
+		requestUrl,
 		nil,
 	)
 	if createReqErr != nil {
-		panic(createReqErr) // NewRequest only errors on bad methods or un-parsable urls
+		panic(createReqErr)
+	}
+
+	q := req.URL.Query()
+	q.Add("name", ClientName)
+	q.Add("url", ClientUrl)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.URL.RawQuery = q.Encode()
+
+	return req
+}
+
+func BuildHttpWhisperRequest(targetUrl string, requestSender string, requestMessage string) (req *http.Request) {
+	requestUrl := fmt.Sprintf("http://%s/recieve", targetUrl)
+	req, createReqErr := http.NewRequest(
+		"GET",
+		requestUrl,
+		nil,
+	)
+	if createReqErr != nil {
+		panic(createReqErr)
 	}
 
 	q := req.URL.Query()
 	q.Add("name", requestSender)
 	q.Add("message", requestMessage)
-	req.URL.RawQuery = q.Encode()
     req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.URL.RawQuery = q.Encode()
 
 	return req
 }
 
-func SendMessage(req *http.Request) (res *http.Response){
-	res, sendReqErr := http.DefaultClient.Do(req)
-	if sendReqErr != nil {
-		panic(sendReqErr) // NewRequest only errors on bad methods or un-parsable urls
-	}
-	return res
-}
-
 func main() {
-	flag.StringVar(&name, "name", "bar", "a string var")
-	flag.IntVar(&port, "port", 8000, "an int")
+	ConnectedHostsMap = make(map[string]string)
+
+	flag.StringVar(&ClientName, "name", "bar", "a string var")
+	flag.IntVar(&Port, "port", 8000, "an int")
 	bootNodesPtr := flag.String("bootnodes", "", "a comma delimited string")
 	flag.Parse()
 
-	// fmt.Println("name:", name)
-	// fmt.Println("port:", port)
+	portSetting := fmt.Sprintf(":%d", Port)
+	ClientUrl = fmt.Sprintf("localhost%s", portSetting)
+
 	if len(*bootNodesPtr) > 0 {
-		connectedHostsMap = make(map[string]string)
 		delimitedNodes := strings.Split(*bootNodesPtr, ",")
 
-		fmt.Println("Foudn Nodes", len(delimitedNodes))
 		for _, node := range delimitedNodes {
-			fmt.Println("Ya here pla", delimitedNodes)
-			RequestInfo(node)
+			RequestConnectNode(node)
 		}
 	}
 
-	portSetting := fmt.Sprintf(":%d", port)
-	sourceUrl = fmt.Sprintf("localhost%s", portSetting)
-
 	router := mux.NewRouter()
-	router.HandleFunc("/whisper", WhisperMessage).Methods("GET")
-	router.HandleFunc("/info", ReturnInfo).Methods("GET")
-	router.HandleFunc("/recieve", RecieveMessage).Methods("GET")
+	router.HandleFunc("/whisper", WhisperMessageHandler).Methods("GET")
+	router.HandleFunc("/connect", ConnectNodeHandler).Methods("GET")
+	router.HandleFunc("/recieve", RecieveMessageHandler).Methods("GET")
 
-	fmt.Println("Listenging  on ", sourceUrl)
 	log.Fatal(http.ListenAndServe(portSetting, router))
 }
